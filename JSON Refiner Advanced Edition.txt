@@ -1,0 +1,473 @@
+!pip install json5
+
+import gradio as gr
+import json
+import re
+import ast
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Any, Tuple, Optional
+import json5
+from jsonschema import validate, ValidationError, Draft7Validator
+from enum import Enum
+
+# =========================================================================
+# JSON REFINER - ADVANCED VERSION WITH PREMIUM FEATURES
+# =========================================================================
+
+class CaseStyle(Enum):
+    """Case conversion styles"""
+    SNAKE_CASE = "snake_case"
+    CAMEL_CASE = "camelCase"
+    KEBAB_CASE = "kebab-case"
+    PASCAL_CASE = "PascalCase"
+
+class JSONRefinerCore:
+    """Advanced JSON parsing and refinement engine"""
+
+    def __init__(self):
+        self.conversion_log = []
+        self.validation_errors = []
+        self.transformation_history = []
+
+    @staticmethod
+    def infer_type(value_str: str) -> Any:
+        """Infers and converts a string to the correct Python/JSON data type."""
+        value = value_str.strip()
+
+        # Check for Booleans and Nulls
+        if value.lower() in ['true', 'yes', 'on', '1']: return True
+        if value.lower() in ['false', 'no', 'off', '0']: return False
+        if value.lower() in ['null', 'none', 'undefined', 'nil', 'n/a', 'na']: return None
+
+        # Try parsing as JSON array or object
+        if (value.startswith('[') and value.endswith(']')) or \
+           (value.startswith('{') and value.endswith('}')):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                try:
+                    # Fallback to ast for things like single-quoted strings in dicts
+                    return ast.literal_eval(value)
+                except (ValueError, SyntaxError):
+                    pass
+
+        # Try Integer
+        try:
+            return int(value)
+        except ValueError:
+            pass
+
+        # Try Float
+        try:
+            return float(value)
+        except ValueError:
+            pass
+
+        # If all else fails, return as string (strip quotes if user provided them)
+        if (value.startswith('"') and value.endswith('"')) or \
+           (value.startswith("'") and value.endswith("'")):
+            return value[1:-1]
+
+        return value
+
+    @staticmethod
+    def normalize_key(key: str, case_style: CaseStyle) -> str:
+        """Converts a string to the specified case style."""
+        # First, normalize to snake_case using a more robust method
+        s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', key)
+        snake = re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+        snake = snake.replace(' ', '_') # Replace spaces introduced by regex with underscores
+
+        if case_style == CaseStyle.SNAKE_CASE:
+            return snake
+        elif case_style == CaseStyle.CAMEL_CASE:
+            components = snake.split('_')
+            if not components: return key
+            return components[0] + ''.join(x.title() for x in components[1:])
+        elif case_style == CaseStyle.PASCAL_CASE:
+            return ''.join(x.title() for x in snake.split('_'))
+        elif case_style == CaseStyle.KEBAB_CASE:
+            return snake.replace('_', '-')
+        return key
+
+    @staticmethod
+    def parse_key_value_text(text: str, case_style: CaseStyle = CaseStyle.SNAKE_CASE) -> Tuple[Dict, List[str]]:
+        """Parse key-value text into dictionary"""
+        result = {}
+        errors = []
+
+        lines = text.split('\n')
+
+        for line_num, line in enumerate(lines, 1):
+            line = line.strip()
+
+            if not line or line.startswith('#'):
+                continue
+
+            if ':' not in line:
+                errors.append(f"Line {line_num}: No colon separator found - '{line}'")
+                continue
+
+            try:
+                key, value = line.split(':', 1)
+                key = JSONRefinerCore.normalize_key(key.strip(), case_style)
+                result[key] = JSONRefinerCore.infer_type(value)
+            except Exception as e:
+                errors.append(f"Line {line_num}: Error parsing - {str(e)}")
+
+        return result, errors
+
+    @staticmethod
+    def validate_json_schema(data: Dict, schema: Dict) -> Tuple[bool, List[str]]:
+        """Validate JSON against schema"""
+        try:
+            validate(instance=data, schema=schema)
+            return True, []
+        except ValidationError as e:
+            return False, [str(e.message)]
+        except Exception as e:
+            return False, [f"Schema validation error: {str(e)}"]
+
+    @staticmethod
+    def check_required_fields(data: Dict, required_fields_str: str) -> Tuple[bool, List[str]]:
+        """Check for required fields"""
+        required_fields = [f.strip() for f in required_fields_str.split(',') if f.strip()]
+        missing = [field for field in required_fields if field not in data]
+        if missing:
+            return False, [f"Missing required fields: {', '.join(missing)}"]
+        return True, []
+
+    @staticmethod
+    def flatten_json(y: Dict) -> Dict:
+        """Convert nested objects to dot-notation"""
+        out = {}
+        def flatten(x, name=''):
+            if type(x) is dict:
+                for a in x:
+                    flatten(x[a], name + a + '.')
+            elif type(x) is list:
+                i = 0
+                for a in x:
+                    flatten(a, name + str(i) + '.')
+                    i += 1
+            else:
+                out[name[:-1]] = x
+        flatten(y)
+        return out
+
+    @staticmethod
+    def unflatten_json(dictionary: Dict) -> Dict:
+        """Reverse flattening"""
+        resultDict = dict()
+        for key, value in dictionary.items():
+            parts = key.split(".")
+            d = resultDict
+            for part in parts[:-1]:
+                if part not in d:
+                    d[part] = dict()
+                d = d[part]
+            d[parts[-1]] = value
+        return resultDict
+
+    # Method for case conversion within the class
+    def convert_json_keys(self, json_text: str, target_case_str: str) -> Tuple[str, str]:
+        """Convert JSON keys to different case styles"""
+        try:
+            data = json.loads(json_text)
+            target_case = CaseStyle[target_case_str.upper().replace('-', '_')]
+
+            def convert_keys_recursive(obj):
+                if isinstance(obj, dict):
+                    return {
+                        self.normalize_key(k, target_case): convert_keys_recursive(v)
+                        for k, v in obj.items()
+                    }
+                elif isinstance(obj, list):
+                    return [convert_keys_recursive(item) for item in obj]
+                return obj
+
+            converted = convert_keys_recursive(data)
+            output = json.dumps(converted, indent=2, ensure_ascii=False)
+            return output, f"Converted to {target_case_str}!"
+        except Exception as e:
+            return "", f"Error: {str(e)}"
+
+
+refiner = JSONRefinerCore()
+
+def generate_stats(data: Dict) -> str:
+    """Generates statistics for the parsed JSON dictionary."""
+    top_keys = len(data)
+    total_keys = 0
+    has_nested = False
+    has_arrays = False
+    has_nulls = False
+    types = set()
+
+    def traverse(obj):
+        nonlocal total_keys, has_nested, has_arrays, has_nulls, types
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                total_keys += 1
+                types.add(type(v).__name__)
+                if v is None: has_nulls = True
+                if isinstance(v, dict): has_nested = True
+                if isinstance(v, list): has_arrays = True
+                traverse(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                types.add(type(item).__name__)
+                if item is None: has_nulls = True
+                if isinstance(item, dict): has_nested = True
+                if isinstance(item, list): has_arrays = True
+                traverse(item)
+
+    # Initial pass for top-level values
+    for k, v in data.items():
+        total_keys += 1
+        types.add(type(v).__name__)
+        if v is None: has_nulls = True
+        if isinstance(v, dict): has_nested = True
+        if isinstance(v, list): has_arrays = True
+        traverse(v)
+
+    # Map Python types to JSON type names for display
+    type_mapping = {'str': 'str', 'int': 'int', 'float': 'float', 'bool': 'bool', 'dict': 'dict', 'list': 'list', 'NoneType': 'null'}
+    display_types = [type_mapping.get(t, t) for t in types]
+
+    stats_md = f"""### 📊 JSON Statistics:
+* **Top-level Keys:** {top_keys}
+* **Total Keys:** {total_keys}
+* **Has Nested Objects:** {has_nested}
+* **Has Arrays:** {has_arrays}
+* **Has Null Values:** {has_nulls}
+* **Value Types:** {', '.join(sorted(display_types))} """
+
+    return stats_md
+
+
+# =========================================================================
+# GRADIO INTERFACE FUNCTIONS
+# =========================================================================
+
+def process_core_text(text, case, remove_nulls, flatten, pretty):
+    case_enum = CaseStyle[case.upper().replace('-', '_')]
+    parsed_data, errors = refiner.parse_key_value_text(text, case_enum)
+
+    if remove_nulls:
+        parsed_data = {k: v for k, v in parsed_data.items() if v is not None}
+
+    final_data = parsed_data
+    if flatten:
+        final_data = refiner.flatten_json(parsed_data)
+
+    indent = 2 if pretty else None
+    try:
+        output = json.dumps(final_data, indent=indent, ensure_ascii=False)
+    except TypeError as e:
+        output = str(final_data) # Fallback for non-JSON serializable data
+        errors.append(f"Serialization Error: {e}. Output might be incomplete.")
+
+    status = "✅ Successfully converted to JSON!" if not errors else "⚠️ Converted with errors:\n" + "\n".join(errors)
+
+    stats = generate_stats(final_data)
+
+    return output, status, stats
+
+def process_validation(json_to_validate_str: str, required_fields_str: str, schema_input_str: str) -> Tuple[str, str]:
+    validation_errors = []
+    try:
+        data = json.loads(json_to_validate_str)
+    except json.JSONDecodeError as e:
+        validation_errors.append(f"Invalid JSON input: {e}")
+        return "❌ Validation Failed: Invalid JSON input", "" # Return immediately on invalid JSON
+
+    # Check required fields
+    is_valid_fields, field_errors = refiner.check_required_fields(data, required_fields_str)
+    if not is_valid_fields:
+        validation_errors.extend(field_errors)
+
+    # Validate against schema if provided
+    if schema_input_str.strip():
+        try:
+            schema = json.loads(schema_input_str)
+            is_valid_schema, schema_errors = refiner.validate_json_schema(data, schema)
+            if not is_valid_schema:
+                validation_errors.extend(schema_errors)
+        except json.JSONDecodeError as e:
+            validation_errors.append(f"Invalid JSON Schema: {e}")
+
+    if validation_errors:
+        return "❌ Validation Failed:\n" + "\n".join(validation_errors), "" # Return errors in status, clear output
+    else:
+        return "✅ JSON is valid!", "" # Return success in status, clear output
+
+def process_case_conversion(json_for_case_str: str, target_case_str: str) -> Tuple[str, str]:
+    converted_json, status_message = refiner.convert_json_keys(json_for_case_str, target_case_str)
+    return converted_json, status_message
+
+def process_merge(json1_str: str, json2_str: str, json3_str: str) -> Tuple[str, str]:
+    merged_data = {}
+    errors = []
+
+    for json_str in [json1_str, json2_str, json3_str]:
+        if json_str.strip():
+            try:
+                data = json.loads(json_str)
+                if isinstance(data, dict):
+                    merged_data.update(data)
+                else:
+                    errors.append(f"Input is not a JSON object: {json_str[:50]}...")
+            except json.JSONDecodeError as e:
+                errors.append(f"Invalid JSON input: {e}")
+
+    if errors:
+        return "", "❌ Merge Failed:\n" + "\n".join(errors)
+
+    output = json.dumps(merged_data, indent=2, ensure_ascii=False)
+    return output, "✅ JSONs merged successfully!"
+
+def process_flatten(json_in_str: str) -> str:
+    try:
+        data = json.loads(json_in_str)
+        flattened_data = refiner.flatten_json(data)
+        return json.dumps(flattened_data, indent=2, ensure_ascii=False)
+    except json.JSONDecodeError as e:
+        return f"Error: Invalid JSON input - {e}"
+    except Exception as e:
+        return f"Error during flattening: {e}"
+
+def process_unflatten(json_in_str: str) -> str:
+    try:
+        data = json.loads(json_in_str)
+        unflattened_data = refiner.unflatten_json(data)
+        return json.dumps(unflattened_data, indent=2, ensure_ascii=False)
+    except json.JSONDecodeError as e:
+        return f"Error: Invalid JSON input - {e}"
+    except Exception as e:
+        return f"Error during unflattening: {e}"
+
+def download_history():
+    return gr.File("history.txt") # Placeholder
+
+def clear_history():
+    return "History cleared!" # Placeholder
+
+
+# =========================================================================
+# GRADIO INTERFACE
+# =========================================================================
+
+with gr.Blocks(theme=gr.themes.Monochrome()) as demo:
+    gr.Markdown("# 🎯 JSON Refiner Advanced Edition\n### Professional JSON Processing Tool")
+
+    with gr.Tabs():
+        # TAB 1: Core Refining
+        with gr.TabItem("🔧 Core Refining"):
+            with gr.Row():
+                with gr.Column():
+                    text_input = gr.Textbox(label="Key-Value Text", lines=12,
+                                            value="name: John Doe\nage: 28\nis_active: true\nbalance: 1500.50\nemail: john@example.com\ntags: [\"admin\", \"user\"]\nmetadata: {\"level\": 5}")
+                    case_style = gr.Radio(["snake_case", "camelCase", "kebab-case", "PascalCase"],
+                                          value="snake_case", label="🎨 Key Case Style")
+                    with gr.Row():
+                        remove_nulls = gr.Checkbox(label="Remove Nulls", value=False)
+                        flatten = gr.Checkbox(label="Flatten", value=False)
+                        pretty_print = gr.Checkbox(label="Pretty Print", value=True)
+                    refine_btn = gr.Button("✨ Refine JSON", variant="primary")
+
+                with gr.Column():
+                    json_output = gr.Code(language="json", label="Refined JSON")
+                    status_output = gr.Markdown("Waiting for input...")
+                    stats_output = gr.Markdown()
+
+            refine_btn.click(process_core_text,
+                             inputs=[text_input, case_style, remove_nulls, flatten, pretty_print],
+                             outputs=[json_output, status_output, stats_output])
+
+        # TAB 2: Validation
+        with gr.TabItem("✅ Validation"):
+            with gr.Row():
+                with gr.Column():
+                    json_to_validate = gr.Code(language="json", label="JSON to Validate", lines=10,
+                                               value='{"name": "John", "age": 28}')
+                    req_fields = gr.Textbox(label="Required Fields (comma-separated)", value="name, age, email")
+                with gr.Column():
+                    schema_input = gr.Code(language="json", label="JSON Schema (optional)", lines=10)
+                    validate_btn = gr.Button("🔍 Validate", variant="primary")
+                    val_status = gr.Markdown()
+            validate_btn.click(process_validation,
+                               inputs=[json_to_validate, req_fields, schema_input],
+                               outputs=[val_status])
+
+        # TAB 3: Case Conversion
+        with gr.TabItem("🎨 Case Conversion"):
+            with gr.Row():
+                with gr.Column():
+                    json_for_case = gr.Code(language="json", label="Input JSON", lines=10,
+                                            value='{"firstName": "John", "lastName": "Doe"}')
+                    target_case = gr.Radio(["snake_case", "camelCase", "kebab-case", "PascalCase"],
+                                           value="kebab-case", label="Target Case Style")
+                    convert_btn = gr.Button("🔄 Convert", variant="primary")
+                with gr.Column():
+                    converted_output = gr.Code(language="json", label="Converted JSON")
+                    conv_status = gr.Markdown()
+            convert_btn.click(process_case_conversion,
+                              inputs=[json_for_case, target_case],
+                              outputs=[converted_output, conv_status])
+
+        # TAB 4: Merge JSON
+        with gr.TabItem("🔗 Merge"):
+            with gr.Row():
+                with gr.Column():
+                    json1 = gr.Code(language="json", label="JSON #1", lines=5, value='{"name": "John"}')
+                    json2 = gr.Code(language="json", label="JSON #2", lines=5, value='{"age": 28}')
+                    json3 = gr.Code(language="json", label="JSON #3 (optional)", lines=5)
+                    merge_btn = gr.Button("Merge JSON", variant="primary")
+                with gr.Column():
+                    merged_out = gr.Code(language="json", label="Merged JSON")
+            merge_btn.click(process_merge,
+                            inputs=[json1, json2, json3],
+                            outputs=[merged_out])
+
+        # TAB 5: Flatten/Unflatten
+        with gr.TabItem("📄 Flatten/Unflatten"):
+            with gr.Tabs():
+                with gr.TabItem("Flatten"):
+                    flat_in = gr.Code(language="json", label="Nested JSON", value='{"user": {"name": "John", "age": 28}}')
+                    flat_btn = gr.Button("Flatten", variant="primary")
+                    flat_out = gr.Code(language="json", label="Flattened JSON")
+                    flat_btn.click(process_flatten,
+                                   inputs=[flat_in],
+                                   outputs=[flat_out])
+                with gr.TabItem("Unflatten"):
+                    unflat_in = gr.Code(language="json", label="Flattened JSON", value='{"user.name": "John", "user.age": 28}')
+                    unflat_btn = gr.Button("Unflatten", variant="primary")
+                    unflat_out = gr.Code(language="json", label="Nested JSON")
+                    unflat_btn.click(process_unflatten,
+                                     inputs=[unflat_in],
+                                     outputs=[unflat_out])
+
+        # TAB 6: History
+        with gr.TabItem("📜 History"):
+            with gr.Row():
+                download_btn = gr.Button("📥 Download History", variant="secondary")
+                clear_btn = gr.Button("🗑️ Clear History", variant="stop")
+            history_text = gr.Textbox(label="History Report", lines=15, value="History logging is not yet fully implemented for direct download/clear within the Gradio interface.")
+            # download_btn.click(download_history, outputs=[gr.File()]) # Requires gr.File support for direct download
+            # clear_btn.click(clear_history, outputs=[history_text]) # Placeholder connection
+
+        # TAB 7: Guide
+        with gr.TabItem("📚 Guide"):
+            gr.Markdown("""
+            ### JSON Refiner - Complete Guide
+            **Input Format:** Use simple `Key: Value` format per line.
+            **Type Inference:** - `true`, `false`, `yes`, `no` -> Boolean
+            - `null`, `none`, `undefined` -> Null
+            - Numeric strings -> Integer/Float
+            """)
+
+# Launch the app
+if __name__ == "__main__":
+    demo.launch(share=True)
